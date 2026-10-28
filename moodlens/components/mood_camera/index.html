@@ -1,0 +1,145 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { margin:0; color:var(--text-color,#eee); font-family:system-ui,sans-serif; }
+    .wrap { border:1px solid rgba(140,140,140,.35); border-radius:16px; padding:12px; }
+    video { width:100%; border-radius:12px; background:#111; transform:scaleX(-1); }
+    button { border:0; border-radius:10px; padding:10px 14px; margin:8px 6px 0 0; cursor:pointer; font-weight:600; }
+    .primary { background:#a8dadc; color:#14202a; }
+    .secondary { background:#303843; color:#fff; }
+    .status { font-size:13px; opacity:.8; margin:8px 0; }
+    .meter { height:6px; border-radius:9px; background:#333; overflow:hidden; margin:6px 0 10px; }
+    .fill { height:100%; background:#a8dadc; width:0%; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div id="status" class="status">Camera is off. Press Start camera to begin.</div>
+  <video id="video" autoplay playsinline muted></video>
+  <div>
+    <button id="start" class="primary">Start camera</button>
+    <button id="stop" class="secondary">Stop camera</button>
+    <button id="send" class="secondary">Use expression scores</button>
+  </div>
+  <p class="status">The video stays in this browser tab. Only numerical expression cues are sent to MoodLens.</p>
+  <div id="scores"></div>
+</div>
+<script type="module">
+  const statusEl = document.getElementById("status");
+  const video = document.getElementById("video");
+  const scoresEl = document.getElementById("scores");
+  let stream = null, landmarker = null, latestScores = {}, loop = null;
+
+  function sendValue(value) {
+    // Streamlit's supported component message protocol; no image or video data is sent.
+    window.parent.postMessage({
+      isStreamlitMessage: true,
+      type: "streamlit:setComponentValue",
+      value
+    }, "*");
+  }
+  function setFrameHeight() {
+    window.parent.postMessage({isStreamlitMessage:true,type:"streamlit:setFrameHeight",height:document.body.scrollHeight}, "*");
+  }
+  window.addEventListener("message", (event) => {
+    if (event.data && event.data.type === "streamlit:render") {
+      window.parent.postMessage({isStreamlitMessage:true,type:"streamlit:componentReady",apiVersion:1}, "*");
+      setFrameHeight();
+    }
+  });
+
+  async function loadModel() {
+    if (landmarker) return landmarker;
+    statusEl.textContent = "Loading facial-expression model in your browser…";
+    const vision = await import("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14");
+    const files = await vision.FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+    );
+    landmarker = await vision.FaceLandmarker.createFromOptions(files, {
+      baseOptions: {
+        modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+        delegate: "GPU"
+      },
+      runningMode: "VIDEO",
+      numFaces: 1,
+      outputFaceBlendshapes: true
+    });
+    return landmarker;
+  }
+
+  function updateScores(result) {
+    const categories = result.faceBlendshapes?.[0]?.categories || [];
+    latestScores = {};
+    for (const item of categories) latestScores[item.categoryName] = item.score;
+    const shown = [
+      ["Smile", Math.max(latestScores.mouthSmileLeft || 0, latestScores.mouthSmileRight || 0)],
+      ["Frown", Math.max(latestScores.mouthFrownLeft || 0, latestScores.mouthFrownRight || 0)],
+      ["Brow tension", Math.max(latestScores.browDownLeft || 0, latestScores.browDownRight || 0)],
+      ["Brow raise", latestScores.browInnerUp || 0]
+    ];
+    scoresEl.innerHTML = shown.map(([name, value]) =>
+      `<div class="status">${name}: ${Math.round(value*100)}%<div class="meter"><div class="fill" style="width:${Math.round(value*100)}%"></div></div></div>`
+    ).join("");
+    statusEl.textContent = categories.length ? "Face detected. Expression cues are being calculated locally." : "No face detected. Try adjusting your lighting and position.";
+  }
+
+  async function detect() {
+    if (!stream || !landmarker) return;
+    if (video.readyState >= 2) {
+      try {
+        const result = landmarker.detectForVideo(video, performance.now());
+        if (result.faceLandmarks?.length) updateScores(result);
+        else {
+          latestScores = {};
+          statusEl.textContent = "No face detected. Try facing the camera in even lighting.";
+        }
+      } catch (e) {}
+    }
+    loop = requestAnimationFrame(detect);
+  }
+
+  document.getElementById("start").addEventListener("click", async () => {
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: {facingMode:"user", width:{ideal:640}, height:{ideal:480}},
+        audio:false
+      });
+      video.srcObject = stream;
+      await video.play();
+      await loadModel();
+      statusEl.textContent = "Camera started. Looking for a face…";
+      detect();
+    } catch (e) {
+      statusEl.textContent = "Could not start camera/model. Allow camera permission and use HTTPS or localhost. " + e.message;
+      sendValue({error: "Camera/model unavailable. Please allow camera permission and check your connection."});
+    }
+    setFrameHeight();
+  });
+
+  document.getElementById("stop").addEventListener("click", () => {
+    if (loop) cancelAnimationFrame(loop);
+    if (stream) stream.getTracks().forEach(track => track.stop());
+    stream = null;
+    video.srcObject = null;
+    latestScores = {};
+    statusEl.textContent = "Camera stopped.";
+  });
+
+  document.getElementById("send").addEventListener("click", () => {
+    if (!Object.keys(latestScores).length) {
+      statusEl.textContent = "No expression scores yet. Start the camera and face it first.";
+      return;
+    }
+    sendValue({scores: latestScores, timestamp: Date.now()});
+    statusEl.textContent = "Expression scores sent to MoodLens. No image was sent.";
+  });
+
+  // Notify the parent component that this iframe is ready.
+  window.parent.postMessage({isStreamlitMessage:true,type:"streamlit:componentReady",apiVersion:1}, "*");
+  setFrameHeight();
+</script>
+</body>
+</html>

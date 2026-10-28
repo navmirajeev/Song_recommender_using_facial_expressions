@@ -1,0 +1,7 @@
+streamlit>=1.40
+spotipy>=2.25.0
+pandas>=2.2
+deepface
+opencv-contrib-python-headless
+werkzeug
+numpy
